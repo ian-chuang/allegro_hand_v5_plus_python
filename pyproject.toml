@@ -1,0 +1,22 @@
+[project]
+name = "allegro-hand-v5"
+version = "0.1.0"
+description = "Python driver and host-side control for the Allegro Hand V5 (F4) / (F4) Plus over CAN"
+readme = "README.md"
+authors = [
+    { name = "Ian Chuang", email = "iantc104@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.23",
+    "python-can>=4.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
