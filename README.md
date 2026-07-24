@@ -21,9 +21,21 @@ talks to it through shared memory.
 
 ## Install
 
+Install straight from GitHub:
+
 ```bash
-uv sync
+pip install git+https://github.com/ian-chuang/allegro_hand_v5_plus_python.git
 ```
+
+or with uv:
+
+```bash
+uv pip install git+https://github.com/ian-chuang/allegro_hand_v5_plus_python.git
+# or add it to a project:
+uv add git+https://github.com/ian-chuang/allegro_hand_v5_plus_python.git
+```
+
+To develop locally, clone the repo and run `uv sync`.
 
 Requires a CAN interface. On Linux with a PEAK PCAN-USB via SocketCAN:
 
