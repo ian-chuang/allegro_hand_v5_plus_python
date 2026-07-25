@@ -1,35 +1,61 @@
-"""Python driver and control library for the Allegro Hand V5 (F4) / (F4) Plus.
+"""
+Python driver for the Allegro Hand V5 (F4) / (F4) Plus.
 
-The V5 hardware is torque(current)-only over CAN, so position control is closed on the
-host. :class:`AllegroHand` runs that control loop in a separate process (its own GIL) for
-reliable real-time timing, communicating with the parent through shared memory.
-
-Modules:
-  * :mod:`allegro_hand_v5.protocol`  - pure CAN frame codec (encode/decode)
-  * :mod:`allegro_hand_v5.driver`    - AllegroHand: process-based real-time driver
-  * :mod:`allegro_hand_v5.config`    - DriverConfig: command mode, limits, PID gains
-  * :mod:`allegro_hand_v5.model`     - handedness/type + per-config joint limits
-  * :mod:`allegro_hand_v5.constants` - verified hardware constants
+Torque-only CAN hardware, driven by WONIK's bundled libBHand grasp library
+plus a host-side control loop. No ROS.
 """
 
-from __future__ import annotations
+from allegro_hand_v5.bhand import BHand, HandType, HardwareType, MotionType
+from allegro_hand_v5.calibration import (
+    DEFAULT_RANGES,
+    JOINT_NAMES,
+    HandCalibration,
+    default_calibration_path,
+    load_calibration,
+)
+from allegro_hand_v5.can_driver import (
+    NUM_FINGERS,
+    NUM_JOINTS,
+    AllegroCANDriver,
+    HandInfo,
+    HandState,
+)
+from allegro_hand_v5.control_loop import ControlLoop, ControlLoopStats, EmergencyStop
+from allegro_hand_v5.exceptions import (
+    AllegroBHandError,
+    AllegroCANError,
+    AllegroConnectionError,
+    AllegroError,
+    AllegroStateError,
+    AllegroTimeoutError,
+)
+from allegro_hand_v5.hand import AllegroHand
 
-from . import constants, protocol
-from .config import DriverConfig
-from .driver import AllegroHand, pd_torque
-from .model import HandModel
-from .protocol import HandInfo, HandSerial, MotorError
+__version__ = "0.1.0"
 
 __all__ = [
     "AllegroHand",
-    "DriverConfig",
-    "HandModel",
+    "AllegroCANDriver",
+    "BHand",
+    "MotionType",
+    "HandType",
+    "HardwareType",
+    "ControlLoop",
+    "ControlLoopStats",
+    "EmergencyStop",
     "HandInfo",
-    "HandSerial",
-    "MotorError",
-    "pd_torque",
-    "constants",
-    "protocol",
+    "HandState",
+    "HandCalibration",
+    "load_calibration",
+    "default_calibration_path",
+    "DEFAULT_RANGES",
+    "JOINT_NAMES",
+    "NUM_JOINTS",
+    "NUM_FINGERS",
+    "AllegroError",
+    "AllegroConnectionError",
+    "AllegroCANError",
+    "AllegroBHandError",
+    "AllegroTimeoutError",
+    "AllegroStateError",
 ]
-
-__version__ = "0.1.0"
