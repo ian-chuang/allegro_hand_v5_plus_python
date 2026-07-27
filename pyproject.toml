@@ -1,7 +1,7 @@
 [project]
 name = "allegro-hand-v5"
-version = "0.1.0"
-description = "Python driver and host-side control for the Allegro Hand V5 (F4) / (F4) Plus over CAN"
+version = "0.2.0"
+description = "Pure-Python CAN driver for the Allegro Hand V5 (F4) / (F4) Plus"
 readme = "README.md"
 authors = [
     { name = "Ian Chuang", email = "iantc104@gmail.com" }

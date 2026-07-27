@@ -12,24 +12,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-from allegro_hand_v5.can_driver import NUM_JOINTS
+from allegro_hand_v5.protocol import FINGER_NAMES, JOINT_LABELS, NUM_JOINTS
 
 logger = logging.getLogger(__name__)
-
-# Joint names, indexed exactly like get_positions().
-JOINT_NAMES = [
-    "Index Spread (0)",   "Index MCP (1)",   "Index PIP (2)",   "Index DIP (3)",
-    "Middle Spread (4)",  "Middle MCP (5)",  "Middle PIP (6)",  "Middle DIP (7)",
-    "Ring Spread (8)",    "Ring MCP (9)",    "Ring PIP (10)",   "Ring DIP (11)",
-    "Thumb Rot (12)",     "Thumb MCP (13)",  "Thumb PIP (14)",  "Thumb DIP (15)",
-]
-
-FINGER_NAMES = ("index", "middle", "ring", "thumb")
 
 # Nominal URDF ranges, used for joints this hand has not had measured.
 DEFAULT_RANGES: Dict[int, Tuple[float, float]] = {
@@ -39,22 +30,71 @@ DEFAULT_RANGES: Dict[int, Tuple[float, float]] = {
     12: (0.00, 1.78),   13: (-0.26, 1.65), 14: (-0.05, 1.85), 15: (-0.09, 1.80),
 }
 
+#: Calibrations shipped with the package, named `<handedness>_<hardware type>.json`.
+BUNDLED_DIR = Path(__file__).resolve().parent / "calibration_data"
+
+#: Directory name searched under the working directory, so a project can
+#: override a bundled calibration without editing the installed package.
 CALIBRATION_DIRNAME = "calibration"
 
-
-def _project_root() -> Path:
-    """Project root for a src-layout install (.../src/allegro_hand_v5 -> ...)."""
-    return Path(__file__).resolve().parent.parent.parent
+#: Environment variable holding an explicit calibration file path.
+ENV_VAR = "ALLEGRO_CALIBRATION"
 
 
-def default_calibration_path(hand_type: str = "right") -> Optional[Path]:
-    """First existing ``calibration/<hand_type>.json`` under cwd or the repo root."""
-    hand_type = str(hand_type).lower()
-    for base in (Path.cwd(), _project_root()):
-        candidate = base / CALIBRATION_DIRNAME / f"{hand_type}.json"
-        if candidate.is_file():
-            return candidate
+def calibration_filenames(handedness: str = "right", hardware_type: Optional[str] = None) -> list:
+    """
+    Candidate file names, most specific first.
+
+    ``("right", "B")`` gives ``["right_B.json", "right.json"]`` — the hand-type
+    specific file if there is one, otherwise a handedness-only file.
+    """
+    handedness = str(handedness).lower()
+    names = []
+    if hardware_type:
+        names.append(f"{handedness}_{str(hardware_type).upper()}.json")
+    names.append(f"{handedness}.json")
+    return names
+
+
+def calibration_search_paths(
+    handedness: str = "right", hardware_type: Optional[str] = None
+) -> list:
+    """Every location checked for a calibration, in priority order."""
+    paths = []
+
+    env = os.environ.get(ENV_VAR)
+    if env:
+        paths.append(Path(env).expanduser())
+
+    names = calibration_filenames(handedness, hardware_type)
+    # A local ./calibration/ directory wins over the bundled files, so a
+    # measurement for your own hand overrides the shipped one.
+    for name in names:
+        paths.append(Path.cwd() / CALIBRATION_DIRNAME / name)
+    for name in names:
+        paths.append(BUNDLED_DIR / name)
+
+    seen, unique = set(), []
+    for p in paths:
+        if str(p) not in seen:
+            seen.add(str(p))
+            unique.append(p)
+    return unique
+
+
+def default_calibration_path(
+    handedness: str = "right", hardware_type: Optional[str] = None
+) -> Optional[Path]:
+    """First existing calibration file for this hand, or None."""
+    for path in calibration_search_paths(handedness, hardware_type):
+        if path.is_file():
+            return path
     return None
+
+
+def available_calibrations() -> list:
+    """Every calibration bundled with the package."""
+    return sorted(BUNDLED_DIR.glob("*.json")) if BUNDLED_DIR.is_dir() else []
 
 
 class HandCalibration:
@@ -70,7 +110,8 @@ class HandCalibration:
     def __init__(
         self,
         ranges: Optional[Mapping[int, Sequence[float]]] = None,
-        hand_type: Optional[str] = None,
+        handedness: Optional[str] = None,
+        hardware_type: Optional[str] = None,
         calibrated_date: Optional[str] = None,
         source: Optional[Union[str, Path]] = None,
     ):
@@ -92,16 +133,19 @@ class HandCalibration:
             self.low[i] = float(lo)
             self.high[i] = float(hi)
 
-        self.hand_type = hand_type
+        self.handedness = handedness
+        self.hardware_type = hardware_type
         self.calibrated_date = calibrated_date
         self.source = Path(source) if source is not None else None
 
     # ==================== Constructors ====================
 
     @classmethod
-    def default(cls, hand_type: Optional[str] = None) -> "HandCalibration":
+    def default(
+        cls, handedness: Optional[str] = None, hardware_type: Optional[str] = None
+    ) -> "HandCalibration":
         """Nominal URDF ranges; nothing measured."""
-        return cls(ranges=None, hand_type=hand_type)
+        return cls(ranges=None, handedness=handedness, hardware_type=hardware_type)
 
     @classmethod
     def from_dict(
@@ -110,7 +154,8 @@ class HandCalibration:
         """
         Build from a parsed JSON document. Both layouts are accepted::
 
-            {"hand_type": ..., "joints": {"12": {"min": .., "max": ..}, ...}}
+            {"handedness": "right", "hardware_type": "B",
+             "joints": {"12": {"min": .., "max": ..}, ...}}
             {"12": [min, max], ...}
         """
         joints = data.get("joints", data)
@@ -129,7 +174,9 @@ class HandCalibration:
 
         return cls(
             ranges=ranges,
-            hand_type=data.get("hand_type"),
+            # "hand_type" is the key older files used for handedness.
+            handedness=data.get("handedness") or data.get("hand_type"),
+            hardware_type=data.get("hardware_type"),
             calibrated_date=data.get("calibration_date"),
             source=source,
         )
@@ -138,39 +185,51 @@ class HandCalibration:
     def load(
         cls,
         path: Optional[Union[str, Path]] = None,
-        hand_type: str = "right",
+        handedness: str = "right",
+        hardware_type: Optional[str] = None,
         required: bool = False,
     ) -> "HandCalibration":
         """
         Load a calibration file, falling back to the URDF defaults.
 
         Args:
-            path: Explicit file. If None, look for ``calibration/<hand_type>.json``.
-            hand_type: Hand to look up when ``path`` is None.
+            path: Explicit file. If None, search `calibration_search_paths()`:
+                $ALLEGRO_CALIBRATION, then ./calibration/, then the copies
+                bundled with the package.
+            handedness: "left" or "right", used when `path` is None.
+            hardware_type: "A" or "B". Selects `<handedness>_<type>.json` in
+                preference to `<handedness>.json`.
             required: Raise FileNotFoundError instead of falling back.
         """
+        label = f"{handedness}{'/' + hardware_type if hardware_type else ''}"
+
         if path is None:
-            path = default_calibration_path(hand_type)
+            path = default_calibration_path(handedness, hardware_type)
 
         if path is None:
             if required:
-                raise FileNotFoundError(f"No calibration found for {hand_type} hand")
-            logger.info("No calibration file for %s hand; using URDF defaults", hand_type)
-            return cls.default(hand_type=hand_type)
+                raise FileNotFoundError(
+                    f"No calibration for the {label} hand. Searched: "
+                    + ", ".join(str(p) for p in calibration_search_paths(handedness, hardware_type))
+                )
+            logger.info("No calibration file for the %s hand; using URDF defaults", label)
+            return cls.default(handedness=handedness, hardware_type=hardware_type)
 
         path = Path(path).expanduser()
         if not path.is_file():
             if required:
                 raise FileNotFoundError(f"Calibration file not found: {path}")
             logger.warning("Calibration file not found: %s; using URDF defaults", path)
-            return cls.default(hand_type=hand_type)
+            return cls.default(handedness=handedness, hardware_type=hardware_type)
 
         with open(path) as f:
             data = json.load(f)
 
         cal = cls.from_dict(data, source=path)
-        if cal.hand_type is None:
-            cal.hand_type = hand_type
+        if cal.handedness is None:
+            cal.handedness = handedness
+        if cal.hardware_type is None:
+            cal.hardware_type = hardware_type
         return cal
 
     # ==================== Limits ====================
@@ -227,7 +286,10 @@ class HandCalibration:
     def summary(self) -> str:
         """Formatted table of the ranges."""
         origin = str(self.source) if self.source else "defaults (URDF)"
-        lines = [f"Calibration ({self.hand_type or 'unknown'} hand) from {origin}"]
+        label = self.handedness or "unknown"
+        if self.hardware_type:
+            label += f" / type {self.hardware_type}"
+        lines = [f"Calibration ({label} hand) from {origin}"]
         if self.calibrated_date:
             lines.append(f"Recorded: {self.calibrated_date}")
         lines.append(f"{'Joint':<22}{'Min':>9}{'Max':>9}{'Range':>9}  Source")
@@ -235,20 +297,22 @@ class HandCalibration:
         for i in range(NUM_JOINTS):
             lo, hi = self.limits(i)
             tag = "measured" if self.calibrated[i] else "default"
-            lines.append(f"{JOINT_NAMES[i]:<22}{lo:>+9.3f}{hi:>+9.3f}{hi - lo:>9.3f}  {tag}")
+            lines.append(f"{JOINT_LABELS[i]:<22}{lo:>+9.3f}{hi:>+9.3f}{hi - lo:>9.3f}  {tag}")
         return "\n".join(lines)
 
     def __repr__(self) -> str:
         n = int(self.calibrated.sum())
         return (
-            f"HandCalibration(hand_type={self.hand_type!r}, "
+            f"HandCalibration(handedness={self.handedness!r}, "
+            f"hardware_type={self.hardware_type!r}, "
             f"measured_joints={n}/{NUM_JOINTS}, source={str(self.source)!r})"
         )
 
 
 def load_calibration(
     calibration: Union[None, bool, str, Path, HandCalibration] = None,
-    hand_type: str = "right",
+    handedness: str = "right",
+    hardware_type: Optional[str] = None,
 ) -> Optional[HandCalibration]:
     """
     Coerce the several ways of specifying a calibration into an object.
@@ -260,5 +324,7 @@ def load_calibration(
     if isinstance(calibration, HandCalibration):
         return calibration
     if calibration is True:
-        return HandCalibration.load(hand_type=hand_type)
-    return HandCalibration.load(path=calibration, hand_type=hand_type)
+        return HandCalibration.load(handedness=handedness, hardware_type=hardware_type)
+    return HandCalibration.load(
+        path=calibration, handedness=handedness, hardware_type=hardware_type
+    )

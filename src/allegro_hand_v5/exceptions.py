@@ -1,25 +1,21 @@
-"""Exception classes for the Allegro Hand V5 driver."""
+"""Exception types for the Allegro Hand V5 driver."""
 
 
 class AllegroError(Exception):
-    """Base exception for all Allegro Hand errors."""
+    """Base class for every error this package raises."""
 
 
 class AllegroConnectionError(AllegroError):
-    """Raised when connection to the hand fails."""
+    """The CAN interface could not be opened."""
 
 
 class AllegroCANError(AllegroError):
-    """Raised when CAN communication fails."""
-
-
-class AllegroBHandError(AllegroError):
-    """Raised when a libBHand operation fails."""
+    """A CAN send or receive failed, or the bus is not open."""
 
 
 class AllegroTimeoutError(AllegroError):
-    """Raised when an operation times out."""
+    """The hand did not respond in time."""
 
 
 class AllegroStateError(AllegroError):
-    """Raised when the hand is in an invalid state for the requested operation."""
+    """The driver is in the wrong state for the requested operation."""
