@@ -1,9 +1,25 @@
-# Where the gain profiles come from
+# Where the gain presets come from
 
-This package does not use `libBHand.so`. The two `bhand_*` profiles in
-`allegro_hand_v5.gains` are nonetheless WONIK's own numbers: they were read out
-of a live libBHand instance before that dependency was dropped, so the default
-behaviour matches the vendor stack without shipping the blob.
+This package does not use `libBHand.so`. The `default` preset in
+`allegro_hand_v5.gains` is nonetheless WONIK's own number, converted into this
+package's units: it was read out of a live libBHand instance before that
+dependency was dropped, so out of the box the hand behaves like the vendor stack
+without shipping the blob.
+
+**Units.** libBHand works in joint torque; this package commands motor current,
+which is the only thing the hand's board actually accepts. Everything below is
+in the original Nm units. To get the numbers in `gains.py`, multiply by the
+1.43 A/Nm the vendor driver uses (`AllegroHandDrv::setTorque`) and halve
+joints 1, 5 and 9, which a Plus hand gears 2:1 — the same halving WONIK applies
+to the current, moved into the gains so nothing is rescaled behind your back:
+
+| | libBHand | here |
+|---|---|---|
+| kp, fingers | 1.0 Nm/rad | 1400 mA/rad (700 on MCP-2) |
+| kp, thumb | 0.8 Nm/rad | 1150 mA/rad |
+| kd, MCP-2 | 0.10 Nm/(rad/s) | 70 mA/(rad/s) |
+| kd, everything else | 0.03 Nm/(rad/s) | 45 mA/(rad/s) |
+| clamp | 0.1 Nm | 150 mA (75 on MCP-2) |
 
 WONIK publishes no source for libBHand — only the binary and a
 [header][hdr] — so everything below was measured by black-box probing: drive
@@ -31,30 +47,33 @@ A naive `d(tau)/dq` reads 1.066 / 1.033 / 1.018; the excess is `−dg/dq`, and
 subtracting the separately-measured gravity gradient lands on exactly 1.0 / 0.8.
 
 **Kd** depends on which motion is active — `SetMotionType()` reinstalls gains,
-which is why the two profiles differ:
+which is why libBHand has two sets:
 
-| | spread / rot | MCP | PIP | DIP | thumb (all 4) |
+| | MCP-1 | MCP-2 | PIP | DIP | thumb (all 4) |
 |---|---|---|---|---|---|
-| `Motion_HomePosition` → `BHAND_HOME` | 0.03 | **0.10** | 0.03 | 0.03 | 0.03 |
-| joint PD → `BHAND_JOINT_PD` | 0.04 | **0.15** | 0.04 | 0.04 | 0.03 |
+| `Motion_HomePosition` (the source of `default`) | 0.03 | **0.10** | 0.03 | 0.03 | 0.03 |
+| joint PD (`SetMotionType`) | 0.04 | **0.15** | 0.04 | 0.04 | 0.03 |
 
-The MCP joints carry roughly 3× the damping of everything else. An independent
+The MCP-2 joints carry roughly 3× the damping of everything else. An independent
 measurement — two constant-velocity ramps ending at the same position, so every
 position-dependent term including gravity cancels — gave 0.0280 and 0.0979 for
-the home profile, i.e. the 0.03 / 0.10 above.
+the home gains, i.e. the 0.03 / 0.10 above.
 
-## Deriving the compliant profiles
+## Deriving the softer presets
 
-`GainProfile.scaled(s)` multiplies **kp by `s` and kd by `sqrt(s)`**. The damping
-ratio of a second-order joint goes as `kd / sqrt(kp · I)`, so scaling both gains
-by the same factor leaves the hand underdamped — the usual mistake. Scaling kd
-by `sqrt(s)` holds `kd/sqrt(kp)` constant:
+`compliant` and `soft` scale **kp by `s` and kd by `sqrt(s)`** (s = 0.5 and 0.25).
+The damping ratio of a second-order joint goes as `kd / sqrt(kp · I)`, so scaling
+both gains by the same factor leaves the hand underdamped — the usual mistake.
+Scaling kd by `sqrt(s)` holds `kd/sqrt(kp)` constant:
 
-| profile | kp | kd (MCP) | kd/√kp |
+| preset | kp (mA/rad) | kd, MCP-2 | kd/√kp |
 |---|---|---|---|
-| `bhand_home` | 1.00 | 0.100 | 0.100 |
-| `compliant` = `scaled(0.5)` | 0.50 | 0.071 | 0.100 |
-| `soft` = `scaled(0.25)` | 0.25 | 0.050 | 0.100 |
+| `default` | 1400 | 70 | 2.6 |
+| `compliant` (s = 0.5) | 700 | 50 | 2.6 |
+| `soft` (s = 0.25) | 350 | 35 | 2.6 |
+
+The presets are written out as plain numbers rather than computed, so what you
+read in `gains.py` is what the loop uses.
 
 ## Gravity compensation
 
@@ -65,7 +84,8 @@ velocity-dependent. Two things worth knowing before you try to replicate it:
   `(π, 0, 0)` produce byte-identical `g(q)`. Tilting the palm is not compensated.
 - Because it is small and orientation-blind, a gravity term computed from your
   simulator's URDF would be strictly better. This package ships none, so a soft
-  profile will visibly sag.
+  preset will visibly sag. If you add one, it goes in your own code: compute a
+  feed-forward current and add it to what `set_current` sends.
 
 ## Other findings, for anyone comparing against the vendor stack
 

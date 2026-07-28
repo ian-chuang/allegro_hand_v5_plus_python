@@ -1,330 +1,230 @@
 """
-Measured joint ranges for one physical Allegro Hand.
+Per-hand joint calibration: measured travel plus a homing offset.
 
-Encoder offsets and mechanical stops differ from hand to hand (the thumb can be
-off by more than a radian), so the nominal URDF ranges rarely match reality.
-This module loads measured ranges from JSON and converts between radians and
-normalized 0..1 fractions of each joint's travel, so a pose written as
-fractions is portable across hands.
+Encoder zeros and mechanical stops differ from hand to hand — on the reference
+V5 Plus the thumb sits more than a radian away from its nominal range — so the
+manual's ROM table rarely matches what you measure. A calibration file records,
+for one physical hand:
+
+* ``min`` / ``max`` — the raw encoder angles seen at each joint's travel limits;
+* ``offset`` — a homing offset added to every raw reading, 0 until you set it.
+
+Everything the driver reports and accepts is in the offset frame:
+
+    position = raw + offset
+    limits   = (min + offset, max + offset)
+
+so re-editing an offset shifts a joint's zero and its limits together. Files
+live in ``calibration_data/<serial>.json`` and are written by
+``examples/calibrate.py``.
 """
 
 from __future__ import annotations
 
 import json
-import logging
-import os
+from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
-from typing import Dict, Mapping, Optional, Sequence, Tuple, Union
+from typing import Optional, Sequence, Union
 
 import numpy as np
 
-from allegro_hand_v5.protocol import FINGER_NAMES, JOINT_LABELS, NUM_JOINTS
+from allegro_hand_v5.protocol import JOINT_NAMES, NUM_JOINTS
 
-logger = logging.getLogger(__name__)
+#: Directory holding the shipped calibrations, one JSON file per serial number.
+CALIBRATION_DIR = Path(__file__).resolve().parent / "calibration_data"
 
-# Nominal URDF ranges, used for joints this hand has not had measured.
-DEFAULT_RANGES: Dict[int, Tuple[float, float]] = {
-    0: (-0.30, 0.30),   1: (-0.01, 1.60),  2: (-0.07, 1.86),  3: (-0.02, 2.01),
-    4: (-0.26, 0.26),   5: (-0.21, 1.79),  6: (-0.12, 1.86),  7: (-0.21, 1.85),
-    8: (-0.26, 0.29),   9: (-0.21, 1.79),  10: (-0.12, 1.86), 11: (-0.21, 1.85),
-    12: (0.00, 1.78),   13: (-0.26, 1.65), 14: (-0.05, 1.85), 15: (-0.09, 1.80),
-}
+#: Nominal range of motion in degrees, from manual section 15.1 (Plus values).
+#: Used when a hand has no calibration file. Per finger: MCP-1, MCP-2, PIP, DIP;
+#: thumb: CMC-1, CMC-2, MP, IP.
+NOMINAL_RANGE_DEG = (
+    (-16.0, 16.0), (-5.0, 110.0), (-3.0, 102.0), (-5.0, 105.0),
+) * 3 + (
+    (0.0, 105.0), (-6.0, 107.0), (-5.0, 106.0), (-4.0, 104.0),
+)
 
-#: Calibrations shipped with the package, named `<handedness>_<hardware type>.json`.
-BUNDLED_DIR = Path(__file__).resolve().parent / "calibration_data"
-
-#: Directory name searched under the working directory, so a project can
-#: override a bundled calibration without editing the installed package.
-CALIBRATION_DIRNAME = "calibration"
-
-#: Environment variable holding an explicit calibration file path.
-ENV_VAR = "ALLEGRO_CALIBRATION"
+NOMINAL_MIN = np.radians([lo for lo, _ in NOMINAL_RANGE_DEG])
+NOMINAL_MAX = np.radians([hi for _, hi in NOMINAL_RANGE_DEG])
 
 
-def calibration_filenames(handedness: str = "right", hardware_type: Optional[str] = None) -> list:
+def _as16(value, name: str) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float64)
+    if array.shape != (NUM_JOINTS,):
+        raise ValueError(f"{name} must have {NUM_JOINTS} values, got {array.shape}")
+    return array
+
+
+@dataclass
+class Calibration:
     """
-    Candidate file names, most specific first.
+    Measured travel and homing offset of one physical hand, in radians.
 
-    ``("right", "B")`` gives ``["right_B.json", "right.json"]`` — the hand-type
-    specific file if there is one, otherwise a handedness-only file.
-    """
-    handedness = str(handedness).lower()
-    names = []
-    if hardware_type:
-        names.append(f"{handedness}_{str(hardware_type).upper()}.json")
-    names.append(f"{handedness}.json")
-    return names
-
-
-def calibration_search_paths(
-    handedness: str = "right", hardware_type: Optional[str] = None
-) -> list:
-    """Every location checked for a calibration, in priority order."""
-    paths = []
-
-    env = os.environ.get(ENV_VAR)
-    if env:
-        paths.append(Path(env).expanduser())
-
-    names = calibration_filenames(handedness, hardware_type)
-    # A local ./calibration/ directory wins over the bundled files, so a
-    # measurement for your own hand overrides the shipped one.
-    for name in names:
-        paths.append(Path.cwd() / CALIBRATION_DIRNAME / name)
-    for name in names:
-        paths.append(BUNDLED_DIR / name)
-
-    seen, unique = set(), []
-    for p in paths:
-        if str(p) not in seen:
-            seen.add(str(p))
-            unique.append(p)
-    return unique
-
-
-def default_calibration_path(
-    handedness: str = "right", hardware_type: Optional[str] = None
-) -> Optional[Path]:
-    """First existing calibration file for this hand, or None."""
-    for path in calibration_search_paths(handedness, hardware_type):
-        if path.is_file():
-            return path
-    return None
-
-
-def available_calibrations() -> list:
-    """Every calibration bundled with the package."""
-    return sorted(BUNDLED_DIR.glob("*.json")) if BUNDLED_DIR.is_dir() else []
-
-
-class HandCalibration:
-    """
-    Measured travel of each joint.
-
-    ``low[i]`` maps to fraction 0.0 and ``high[i]`` to fraction 1.0. That
-    ordering may be reversed (``low > high``) when a joint's encoder runs
-    backwards; clipping always uses the true min/max, so the reversal only
-    affects fraction direction.
+    Attributes:
+        min: (16,) raw encoder angle at each joint's low limit.
+        max: (16,) raw encoder angle at each joint's high limit.
+        offset: (16,) homing offset added to every raw reading.
+        serial: Serial number of the hand this was measured on.
+        date: ISO date it was recorded.
+        path: File it was loaded from, if any.
     """
 
-    def __init__(
-        self,
-        ranges: Optional[Mapping[int, Sequence[float]]] = None,
-        handedness: Optional[str] = None,
-        hardware_type: Optional[str] = None,
-        calibrated_date: Optional[str] = None,
-        source: Optional[Union[str, Path]] = None,
-    ):
-        ranges = dict(ranges or {})
+    min: np.ndarray = field(default_factory=lambda: NOMINAL_MIN.copy())
+    max: np.ndarray = field(default_factory=lambda: NOMINAL_MAX.copy())
+    offset: np.ndarray = field(default_factory=lambda: np.zeros(NUM_JOINTS))
+    serial: str = ""
+    date: str = ""
+    path: Optional[Path] = None
 
-        self.low = np.zeros(NUM_JOINTS, dtype=np.float64)
-        self.high = np.zeros(NUM_JOINTS, dtype=np.float64)
-        self.calibrated = np.zeros(NUM_JOINTS, dtype=bool)
+    def __post_init__(self):
+        self.min = _as16(self.min, "min")
+        self.max = _as16(self.max, "max")
+        self.offset = _as16(self.offset, "offset")
 
-        for i in range(NUM_JOINTS):
-            if i in ranges:
-                lo, hi = ranges[i]
-                self.calibrated[i] = True
-            elif str(i) in ranges:  # tolerate string keys straight from JSON
-                lo, hi = ranges[str(i)]
-                self.calibrated[i] = True
-            else:
-                lo, hi = DEFAULT_RANGES[i]
-            self.low[i] = float(lo)
-            self.high[i] = float(hi)
-
-        self.handedness = handedness
-        self.hardware_type = hardware_type
-        self.calibrated_date = calibrated_date
-        self.source = Path(source) if source is not None else None
-
-    # ==================== Constructors ====================
-
-    @classmethod
-    def default(
-        cls, handedness: Optional[str] = None, hardware_type: Optional[str] = None
-    ) -> "HandCalibration":
-        """Nominal URDF ranges; nothing measured."""
-        return cls(ranges=None, handedness=handedness, hardware_type=hardware_type)
-
-    @classmethod
-    def from_dict(
-        cls, data: Mapping, source: Optional[Union[str, Path]] = None
-    ) -> "HandCalibration":
-        """
-        Build from a parsed JSON document. Both layouts are accepted::
-
-            {"handedness": "right", "hardware_type": "B",
-             "joints": {"12": {"min": .., "max": ..}, ...}}
-            {"12": [min, max], ...}
-        """
-        joints = data.get("joints", data)
-
-        ranges: Dict[int, Tuple[float, float]] = {}
-        for key, value in joints.items():
-            try:
-                idx = int(key)
-            except (TypeError, ValueError):
-                continue  # metadata key in a flat document
-            if isinstance(value, Mapping):
-                ranges[idx] = (float(value["min"]), float(value["max"]))
-            else:
-                lo, hi = value
-                ranges[idx] = (float(lo), float(hi))
-
-        return cls(
-            ranges=ranges,
-            # "hand_type" is the key older files used for handedness.
-            handedness=data.get("handedness") or data.get("hand_type"),
-            hardware_type=data.get("hardware_type"),
-            calibrated_date=data.get("calibration_date"),
-            source=source,
-        )
-
-    @classmethod
-    def load(
-        cls,
-        path: Optional[Union[str, Path]] = None,
-        handedness: str = "right",
-        hardware_type: Optional[str] = None,
-        required: bool = False,
-    ) -> "HandCalibration":
-        """
-        Load a calibration file, falling back to the URDF defaults.
-
-        Args:
-            path: Explicit file. If None, search `calibration_search_paths()`:
-                $ALLEGRO_CALIBRATION, then ./calibration/, then the copies
-                bundled with the package.
-            handedness: "left" or "right", used when `path` is None.
-            hardware_type: "A" or "B". Selects `<handedness>_<type>.json` in
-                preference to `<handedness>.json`.
-            required: Raise FileNotFoundError instead of falling back.
-        """
-        label = f"{handedness}{'/' + hardware_type if hardware_type else ''}"
-
-        if path is None:
-            path = default_calibration_path(handedness, hardware_type)
-
-        if path is None:
-            if required:
-                raise FileNotFoundError(
-                    f"No calibration for the {label} hand. Searched: "
-                    + ", ".join(str(p) for p in calibration_search_paths(handedness, hardware_type))
-                )
-            logger.info("No calibration file for the %s hand; using URDF defaults", label)
-            return cls.default(handedness=handedness, hardware_type=hardware_type)
-
-        path = Path(path).expanduser()
-        if not path.is_file():
-            if required:
-                raise FileNotFoundError(f"Calibration file not found: {path}")
-            logger.warning("Calibration file not found: %s; using URDF defaults", path)
-            return cls.default(handedness=handedness, hardware_type=hardware_type)
-
-        with open(path) as f:
-            data = json.load(f)
-
-        cal = cls.from_dict(data, source=path)
-        if cal.handedness is None:
-            cal.handedness = handedness
-        if cal.hardware_type is None:
-            cal.hardware_type = hardware_type
-        return cal
-
-    # ==================== Limits ====================
+    # ==================== Use ====================
 
     @property
     def lower(self) -> np.ndarray:
-        """Per-joint minimum in radians."""
-        return np.minimum(self.low, self.high)
+        """Per-joint lower limit in the offset frame."""
+        return np.minimum(self.min, self.max) + self.offset
 
     @property
     def upper(self) -> np.ndarray:
-        """Per-joint maximum in radians."""
-        return np.maximum(self.low, self.high)
+        """Per-joint upper limit in the offset frame."""
+        return np.maximum(self.min, self.max) + self.offset
 
     @property
     def center(self) -> np.ndarray:
+        """Midpoint of each joint's travel, in the offset frame."""
         return 0.5 * (self.lower + self.upper)
 
-    def limits(self, joint_idx: int) -> Tuple[float, float]:
-        """(min, max) in radians for one joint."""
-        return float(self.lower[joint_idx]), float(self.upper[joint_idx])
+    def apply(self, raw: Sequence[float]) -> np.ndarray:
+        """Raw encoder angles -> offset frame. This is what the driver reports."""
+        return _as16(raw, "positions") + self.offset
 
-    def clip(self, positions: Union[Sequence[float], np.ndarray]) -> np.ndarray:
-        """Clip a 16-joint target into the measured range."""
-        positions = np.asarray(positions, dtype=np.float64)
-        if positions.shape[-1] != NUM_JOINTS:
-            raise ValueError(f"Expected {NUM_JOINTS} positions, got {positions.shape[-1]}")
-        return np.clip(positions, self.lower, self.upper)
+    def clip(self, positions: Sequence[float]) -> np.ndarray:
+        """Clip a 16-joint target into the calibrated range."""
+        return np.clip(_as16(positions, "positions"), self.lower, self.upper)
 
-    # ==================== Fractions <-> radians ====================
+    def denormalize(self, fractions: Sequence[float]) -> np.ndarray:
+        """16 fractions (0 = lower limit, 1 = upper) -> radians."""
+        return self.lower + _as16(fractions, "fractions") * (self.upper - self.lower)
 
-    def from_fractions(self, fractions: Union[Sequence[float], np.ndarray]) -> np.ndarray:
-        """16 fractions (0 = low, 1 = high) -> radians, clipped to the range."""
-        fractions = np.asarray(fractions, dtype=np.float64)
-        if fractions.shape[-1] != NUM_JOINTS:
-            raise ValueError(f"Expected {NUM_JOINTS} fractions, got {fractions.shape[-1]}")
-        return self.clip(self.low + fractions * (self.high - self.low))
+    def normalize(self, positions: Sequence[float]) -> np.ndarray:
+        """Radians -> fractions of travel (0 = lower limit, 1 = upper)."""
+        span = self.upper - self.lower
+        return (_as16(positions, "positions") - self.lower) / np.where(span > 1e-9, span, 1.0)
 
-    def to_fractions(self, positions: Union[Sequence[float], np.ndarray]) -> np.ndarray:
-        """Radians -> fractions (0 = low, 1 = high)."""
-        positions = np.asarray(positions, dtype=np.float64)
-        span = self.high - self.low
-        safe = np.where(np.abs(span) < 1e-9, 1.0, span)
-        return (positions - self.low) / safe
+    # ==================== Files ====================
 
-    def joint(self, joint_idx: int, fraction: float) -> float:
-        """Radians at ``fraction`` of one joint's travel."""
-        lo, hi = self.low[joint_idx], self.high[joint_idx]
-        value = lo + float(fraction) * (hi - lo)
-        return float(np.clip(value, self.lower[joint_idx], self.upper[joint_idx]))
+    @staticmethod
+    def path_for(serial: str) -> Path:
+        """Where the calibration for a serial number lives."""
+        return CALIBRATION_DIR / f"{serial}.json"
+
+    @classmethod
+    def for_serial(cls, serial: str) -> "Calibration":
+        """Load `calibration_data/<serial>.json`, or nominal limits if absent."""
+        path = cls.path_for(serial)
+        return cls.load(path) if path.is_file() else cls(serial=serial)
+
+    @classmethod
+    def load(cls, path: Union[str, Path]) -> "Calibration":
+        """Load a calibration file. Raises FileNotFoundError if it is missing."""
+        path = Path(path).expanduser()
+        with open(path) as f:
+            data = json.load(f)
+        cal = cls.from_dict(data)
+        cal.path = path
+        return cal
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Calibration":
+        """Build from a parsed calibration document."""
+        cal = cls(serial=data.get("serial", ""), date=data.get("date", ""))
+        for name, values in data.get("joints", {}).items():
+            if name not in JOINT_NAMES:
+                raise ValueError(f"unknown joint name {name!r} in calibration")
+            i = JOINT_NAMES.index(name)
+            cal.min[i] = float(values["min"])
+            cal.max[i] = float(values["max"])
+            cal.offset[i] = float(values.get("offset", 0.0))
+        return cal
+
+    def to_dict(self) -> dict:
+        """The document written to disk. All angles in radians."""
+        return {
+            "serial": self.serial,
+            "date": self.date or date.today().isoformat(),
+            "units": "radians",
+            "note": "min/max are raw encoder angles; offset is added to every reading",
+            "joints": {
+                name: {
+                    "min": round(float(self.min[i]), 5),
+                    "max": round(float(self.max[i]), 5),
+                    "offset": round(float(self.offset[i]), 5),
+                }
+                for i, name in enumerate(JOINT_NAMES)
+            },
+        }
+
+    def save(self, path: Union[str, Path, None] = None) -> Path:
+        """
+        Write to `path`, or to `calibration_data/<serial>.json` by default.
+
+        Returns the path written.
+        """
+        if path is None:
+            if not self.serial:
+                raise ValueError("no serial number: pass an explicit path")
+            path = self.path_for(self.serial)
+        path = Path(path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_dict(), indent=2) + "\n")
+        self.path = path
+        return path
 
     # ==================== Display ====================
 
     def summary(self) -> str:
-        """Formatted table of the ranges."""
-        origin = str(self.source) if self.source else "defaults (URDF)"
-        label = self.handedness or "unknown"
-        if self.hardware_type:
-            label += f" / type {self.hardware_type}"
-        lines = [f"Calibration ({label} hand) from {origin}"]
-        if self.calibrated_date:
-            lines.append(f"Recorded: {self.calibrated_date}")
-        lines.append(f"{'Joint':<22}{'Min':>9}{'Max':>9}{'Range':>9}  Source")
-        lines.append("-" * 62)
-        for i in range(NUM_JOINTS):
-            lo, hi = self.limits(i)
-            tag = "measured" if self.calibrated[i] else "default"
-            lines.append(f"{JOINT_LABELS[i]:<22}{lo:>+9.3f}{hi:>+9.3f}{hi - lo:>9.3f}  {tag}")
+        """Formatted table of the calibrated range, in degrees."""
+        lines = [
+            f"Calibration for {self.serial or 'unknown hand'}"
+            f"{f' ({self.date})' if self.date else ''}"
+            f"  from {self.path or 'nominal limits'}",
+            f"{'joint':<14}{'min':>9}{'max':>9}{'offset':>9}   (degrees)",
+            "-" * 50,
+        ]
+        for i, name in enumerate(JOINT_NAMES):
+            lines.append(
+                f"{name:<14}{np.degrees(self.lower[i]):>9.1f}"
+                f"{np.degrees(self.upper[i]):>9.1f}{np.degrees(self.offset[i]):>9.1f}"
+            )
         return "\n".join(lines)
 
     def __repr__(self) -> str:
-        n = int(self.calibrated.sum())
-        return (
-            f"HandCalibration(handedness={self.handedness!r}, "
-            f"hardware_type={self.hardware_type!r}, "
-            f"measured_joints={n}/{NUM_JOINTS}, source={str(self.source)!r})"
-        )
+        return (f"Calibration(serial={self.serial!r}, date={self.date!r}, "
+                f"path={str(self.path) if self.path else None!r})")
 
 
 def load_calibration(
-    calibration: Union[None, bool, str, Path, HandCalibration] = None,
-    handedness: str = "right",
-    hardware_type: Optional[str] = None,
-) -> Optional[HandCalibration]:
+    calibration: Union[None, bool, str, Path, Calibration] = True,
+    serial: str = "",
+) -> Optional[Calibration]:
     """
     Coerce the several ways of specifying a calibration into an object.
 
-    Returns None when ``calibration`` is None or False (i.e. clipping disabled).
+    Args:
+        calibration: True to look up `serial` in `calibration_data/`, a path to
+            load, a `Calibration` to use as is, or None/False to disable it.
+        serial: Serial number, used when `calibration` is True.
+
+    Returns:
+        A Calibration, or None if calibration is disabled.
     """
     if calibration is None or calibration is False:
         return None
-    if isinstance(calibration, HandCalibration):
+    if isinstance(calibration, Calibration):
         return calibration
     if calibration is True:
-        return HandCalibration.load(handedness=handedness, hardware_type=hardware_type)
-    return HandCalibration.load(
-        path=calibration, handedness=handedness, hardware_type=hardware_type
-    )
+        return Calibration.for_serial(serial)
+    return Calibration.load(calibration)

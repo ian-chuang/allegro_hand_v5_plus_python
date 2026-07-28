@@ -1,6 +1,6 @@
 [project]
 name = "allegro-hand-v5"
-version = "0.2.0"
+version = "0.3.0"
 description = "Pure-Python CAN driver for the Allegro Hand V5 (F4) / (F4) Plus"
 readme = "README.md"
 authors = [
@@ -20,3 +20,7 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

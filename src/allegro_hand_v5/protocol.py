@@ -1,8 +1,9 @@
 """
 Allegro Hand V5 CAN protocol: message IDs, encoding, decoding.
 
-Pure functions and constants only — no I/O, no state. Everything here follows
-section 11 of the V5 (4F) user manual; see `docs/allegro_hand_v5_manual.md`.
+Pure functions and constants, no I/O and no state. Follows section 11 of the
+V5 (4F) user manual (`docs/allegro_hand_v5_manual.md`) and, where the manual is
+silent, WONIK's own `allegro_hand_ros2_v5` driver (`candef.h`, `socket_can.cpp`).
 
 Wire format: the message ID sits in the upper bits of the 11-bit standard
 arbitration field, so the frame ID is `message_id << 2`. All multi-byte values
@@ -13,9 +14,9 @@ from __future__ import annotations
 
 import math
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum, IntFlag
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -25,80 +26,76 @@ NUM_JOINTS = NUM_FINGERS * NUM_JOINTS_PER_FINGER  # 16
 
 FINGER_NAMES = ("index", "middle", "ring", "thumb")
 
-#: Machine-friendly joint names, in the order every 16-vector uses.
+#: Joint names in the order every 16-vector uses, using the manual's naming
+#: (section 15.1): MCP-1 is the spread/abduction joint, MCP-2 the base flexion.
 JOINT_NAMES = (
-    "index_spread", "index_mcp", "index_pip", "index_dip",
-    "middle_spread", "middle_mcp", "middle_pip", "middle_dip",
-    "ring_spread", "ring_mcp", "ring_pip", "ring_dip",
-    "thumb_rot", "thumb_mcp", "thumb_pip", "thumb_dip",
+    "index_mcp1", "index_mcp2", "index_pip", "index_dip",
+    "middle_mcp1", "middle_mcp2", "middle_pip", "middle_dip",
+    "ring_mcp1", "ring_mcp2", "ring_pip", "ring_dip",
+    "thumb_cmc1", "thumb_cmc2", "thumb_mp", "thumb_ip",
 )
 
-#: The same joints, for printing.
-JOINT_LABELS = tuple(
-    f"{name.replace('_', ' ').title()} ({i})" for i, name in enumerate(JOINT_NAMES)
-)
+JOINT_INDEX = {name: i for i, name in enumerate(JOINT_NAMES)}
 
 
 class MsgID(IntEnum):
-    """Message IDs from manual section 11.2 (pre-shift; wire ID is `id << 2`)."""
+    """Message IDs (pre-shift; the wire arbitration ID is `id << 2`)."""
 
+    # --- commands, host -> hand ---
     SERVO_ON = 0x040
     SERVO_OFF = 0x041
+    SET_TORQUE = 0x060  # +0..3, one frame per finger. Payload is motor current.
+    SET_POSE = 0x0E0  # +0..3. Undocumented for V5; see bus.send_pose().
+    SET_PERIOD = 0x081  # report periods for position / IMU / temperature
+    PICK = 0x011
+    PLACE = 0x012
+    CALIBRATE = 0x089  # start the hand's own position calibration
+    CALIBRATE_DONE = 0x092  # the hand's reply when it finishes
 
-    SET_TORQUE = 0x060  # +0..3, one per finger
+    # --- feedback, hand -> host (RTR-readable, and periodic where noted) ---
+    INFO = 0x080
+    SERIAL = 0x088
+    POSITION = 0x020  # +0..3, periodic
+    IMU = 0x030  # periodic
+    TEMPERATURE = 0x038  # +0..3, periodic
+    ERROR = 0x0EE
 
-    INFO = 0x080  # RTR-readable
-    SERIAL = 0x088  # RTR-readable
-    POSITION = 0x020  # +0..3, RTR-readable or periodic
-
-    # Fingertip pressure. The v1.3 manual documents 0x050/0x052, but current
-    # firmware actually streams these at 0x0F0/0x0F2 (confirmed on a real V5
-    # Plus, serial 5TBR0017). Both are accepted; see PRESSURE_ID_TO_FINGER.
+    # Fingertip pressure. The v1.3 manual documents 0x050/0x052 and so does
+    # WONIK's driver, but current firmware streams these at 0x0F0/0x0F2
+    # (confirmed on a real V5 Plus, serial 5TBR0017). Both are accepted.
     PRESSURE_1 = 0x0F0  # index, middle
     PRESSURE_2 = 0x0F2  # ring, thumb
     PRESSURE_1_LEGACY = 0x050
     PRESSURE_2_LEGACY = 0x052
 
-    PICK = 0x011
-    PLACE = 0x012
-    ERROR = 0x0EE
-
-    # Not in the V5 manual's ID table, but the firmware accepts it and it is
-    # what makes the hand stream positions instead of needing an RTR per cycle.
-    # Inherited from the V4 protocol (candef.h).
-    SET_PERIOD = 0x081
-
 
 ID_SHIFT = 2
 CAN_BITRATE = 1_000_000  # 1 Mbps
 
-#: Joint encoder resolution: 0.088 deg per LSB, converted to radians.
-POSITION_SCALE = (math.pi / 180.0) * 0.088
+#: Joint encoder resolution: 0.088 deg per LSB, in radians (manual 11.3.6).
+POSITION_SCALE = math.radians(0.088)
 
-#: Motor current per unit of joint torque, mA/Nm. The Set Torque field is in mA
-#: (manual 11.3.3); this is the conversion the reference stack uses.
-TORQUE_TO_CURRENT = 1.43 * 1000.0
+#: Absolute per-joint current clamp, mA. The only actuation command is a motor
+#: current, and WONIK's driver saturates it here before every transmit.
+MAX_CURRENT_MA = 240.0
 
-#: Per-joint current clamp used by the reference stack, in mA.
-DEFAULT_MAX_CURRENT_MA = 240.0
+#: MCP-2 joints of index/middle/ring. On a "Plus" (type B) hand these are geared
+#: 576.7:1 instead of 288.35:1, so the same current gives twice the joint torque.
+#: Nothing here rescales them — the gain presets carry halved numbers for these
+#: joints instead, so what you command is what goes on the wire.
+PLUS_GEARED_JOINTS = (1, 5, 9)
 
-#: Every accepted fingertip-pressure message ID -> index of the first finger it
-#: carries. The low ID reports [index, middle]; the high ID [ring, thumb].
+#: Fingertip readings outside 0..this many Pa are reported as 0, the same sanity
+#: check WONIK's driver applies.
+PRESSURE_VALID_MAX = 5000
+
+#: Pressure message ID -> index of the first finger it carries.
 PRESSURE_ID_TO_FINGER = {
     MsgID.PRESSURE_1: 0,
     MsgID.PRESSURE_1_LEGACY: 0,
     MsgID.PRESSURE_2: 2,
     MsgID.PRESSURE_2_LEGACY: 2,
 }
-
-#: On "Plus" (type B) hands the MCP-2 joint of index/middle/ring has roughly
-#: twice the gear ratio, so its current command is halved. The thumb is not
-#: affected. Matches the stock driver.
-PLUS_HALVED_JOINTS = (1, 5, 9)
-
-#: Fingertip readings outside 0..this many Pa are treated as invalid and
-#: reported as 0, the same sanity check the stock driver applies.
-PRESSURE_VALID_MAX = 5000
 
 
 class ErrorFlag(IntFlag):
@@ -112,8 +109,6 @@ class ErrorFlag(IntFlag):
 
     def describe(self) -> str:
         """Human-readable list of the conditions set in this code."""
-        if not self:
-            return "none"
         names = {
             ErrorFlag.INPUT_VOLTAGE: "input voltage out of range",
             ErrorFlag.OVERHEATING: "overheating",
@@ -121,13 +116,10 @@ class ErrorFlag(IntFlag):
             ErrorFlag.OVERLOAD: "overload",
         }
         known = [text for flag, text in names.items() if self & flag]
-        unknown = int(self) & ~int(
-            ErrorFlag.INPUT_VOLTAGE | ErrorFlag.OVERHEATING
-            | ErrorFlag.ELECTRICAL_SHOCK | ErrorFlag.OVERLOAD
-        )
+        unknown = int(self) & ~sum(int(f) for f in names)
         if unknown:
             known.append(f"reserved bits 0x{unknown:02X}")
-        return ", ".join(known)
+        return ", ".join(known) or "none"
 
 
 @dataclass
@@ -151,20 +143,20 @@ class JointError:
 class HandInfo:
     """Identity of the connected hand, from the Info and Serial messages."""
 
+    serial_number: str = ""
     hardware_version: Optional[int] = None
     firmware_version: Optional[int] = None
-    serial_number: str = ""
 
     @property
     def handedness(self) -> str:
-        """"right", "left", or "unknown". Character 3 of the serial number."""
+        """"right", "left" or "unknown" — character 3 of the serial number."""
         if len(self.serial_number) > 3:
             return {"R": "right", "L": "left"}.get(self.serial_number[3], "unknown")
         return "unknown"
 
     @property
     def hardware_type(self) -> str:
-        """"A" (non-geared), "B" (geared), or "unknown". Character 2 of the serial."""
+        """"A" (non-geared), "B" (geared/Plus) or "unknown" — character 2."""
         if len(self.serial_number) > 2 and self.serial_number[2] in "AB":
             return self.serial_number[2]
         return "unknown"
@@ -174,71 +166,82 @@ class HandInfo:
         """True once the hand has identified itself.
 
         Only the serial number is required: it carries handedness and hardware
-        type, and real firmware frequently ignores the Information RTR (0x080).
-        Gating on the version would mean never recognising a working hand.
+        type, and real firmware often ignores the Information RTR (0x080).
         """
         return bool(self.serial_number)
 
     def __str__(self) -> str:
-        hw = f"0x{self.hardware_version:04X}" if self.hardware_version is not None else "?"
-        fw = f"0x{self.firmware_version:04X}" if self.firmware_version is not None else "?"
+        hw = "?" if self.hardware_version is None else f"0x{self.hardware_version:04X}"
+        fw = "?" if self.firmware_version is None else f"0x{self.firmware_version:04X}"
         return (
             f"Allegro Hand V5  serial={self.serial_number or '?'}  "
             f"{self.handedness} hand, type {self.hardware_type}  hw={hw} fw={fw}"
         )
 
 
+def frame_id(msg_id: int) -> int:
+    """Wire arbitration ID for a message ID."""
+    return msg_id << ID_SHIFT
+
+
+def message_id(arbitration_id: int) -> int:
+    """Message ID for a wire arbitration ID."""
+    return arbitration_id >> ID_SHIFT
+
+
+def finger_slice(finger: int) -> slice:
+    """Slice of a 16-joint array belonging to one finger."""
+    return slice(finger * NUM_JOINTS_PER_FINGER, (finger + 1) * NUM_JOINTS_PER_FINGER)
+
+
 # ==================== Encoding (host -> hand) ====================
 
 
-def frame_id(message_id: int) -> int:
-    """Wire arbitration ID for a message ID."""
-    return message_id << ID_SHIFT
-
-
-def message_id(frame_id_: int) -> int:
-    """Message ID for a wire arbitration ID."""
-    return frame_id_ >> ID_SHIFT
-
-
-def encode_torque(finger: int, currents_ma) -> Tuple[int, bytes]:
+def encode_currents(finger: int, currents_ma) -> Tuple[int, bytes]:
     """
     Set Torque frame for one finger (manual 11.3.3).
 
     Args:
         finger: 0-3.
-        currents_ma: 4 motor currents in mA, one per joint.
+        currents_ma: 4 motor currents in mA, one per joint of that finger.
 
     Returns:
         (frame_id, 8 data bytes) — four int16 little-endian.
     """
     if not 0 <= finger < NUM_FINGERS:
         raise ValueError(f"finger must be 0-3, got {finger}")
-    values = [int(round(float(v))) for v in currents_ma]
-    if len(values) != NUM_JOINTS_PER_FINGER:
-        raise ValueError(f"expected {NUM_JOINTS_PER_FINGER} currents, got {len(values)}")
-    clipped = [max(-32768, min(32767, v)) for v in values]
-    return frame_id(MsgID.SET_TORQUE + finger), struct.pack("<hhhh", *clipped)
+    values = np.asarray(currents_ma, dtype=np.float64)
+    if values.shape != (NUM_JOINTS_PER_FINGER,):
+        raise ValueError(f"expected {NUM_JOINTS_PER_FINGER} currents, got {values.shape}")
+    clipped = np.clip(np.round(values), -MAX_CURRENT_MA, MAX_CURRENT_MA).astype(np.int64)
+    return frame_id(MsgID.SET_TORQUE + finger), struct.pack("<4h", *clipped)
 
 
-def encode_period(position_ms: int = 3, imu_ms: int = 0, temperature_ms: int = 0) -> Tuple[int, bytes]:
+def encode_pose(finger: int, positions_rad) -> Tuple[int, bytes]:
     """
-    Set the hand's autonomous report periods. 0 disables a stream.
+    Set Pose frame for one finger (0x0E0+f). Same scaling as Position Finger.
 
-    Not documented in the V5 manual's ID table, but accepted by the firmware and
-    required to make the hand stream positions rather than answering RTRs.
+    Inherited from the V4 protocol and absent from the V5 manual; the firmware
+    may ignore it. See `AllegroCANBus.send_pose`.
+    """
+    if not 0 <= finger < NUM_FINGERS:
+        raise ValueError(f"finger must be 0-3, got {finger}")
+    values = np.asarray(positions_rad, dtype=np.float64)
+    if values.shape != (NUM_JOINTS_PER_FINGER,):
+        raise ValueError(f"expected {NUM_JOINTS_PER_FINGER} positions, got {values.shape}")
+    counts = np.clip(np.round(values / POSITION_SCALE), -32768, 32767).astype(np.int64)
+    return frame_id(MsgID.SET_POSE + finger), struct.pack("<4h", *counts)
+
+
+def encode_period(position_ms: int = 3, imu_ms: int = 0, temperature_ms: int = 0):
+    """
+    Set the hand's autonomous report periods, in ms. 0 disables a stream.
+
+    Not in the V5 manual's ID table, but WONIK's driver sends it at start-up and
+    it is what makes the hand stream positions instead of answering one RTR per
+    cycle. Six data bytes, three int16 little-endian.
     """
     return frame_id(MsgID.SET_PERIOD), struct.pack("<3h", position_ms, imu_ms, temperature_ms)
-
-
-def torque_to_current(torque_nm, scale: float = TORQUE_TO_CURRENT) -> np.ndarray:
-    """Joint torque in Nm -> motor current in mA."""
-    return np.asarray(torque_nm, dtype=np.float64) * scale
-
-
-def current_to_torque(current_ma, scale: float = TORQUE_TO_CURRENT) -> np.ndarray:
-    """Motor current in mA -> joint torque in Nm."""
-    return np.asarray(current_ma, dtype=np.float64) / scale
 
 
 # ==================== Decoding (hand -> host) ====================
@@ -248,55 +251,59 @@ def decode_position(data: bytes) -> np.ndarray:
     """Position Finger frame (manual 11.3.6) -> 4 joint angles in radians."""
     if len(data) < 8:
         raise ValueError(f"position frame needs 8 bytes, got {len(data)}")
-    return np.array(struct.unpack("<hhhh", data[:8]), dtype=np.float64) * POSITION_SCALE
+    return np.array(struct.unpack("<4h", data[:8]), dtype=np.float64) * POSITION_SCALE
 
 
 def decode_pressure(data: bytes) -> Tuple[int, int]:
     """Fingertip Pressure frame (manual 11.3.7) -> two pressures in Pa."""
     if len(data) < 8:
         raise ValueError(f"pressure frame needs 8 bytes, got {len(data)}")
-    return struct.unpack("<ii", data[:8])
+    first, second = struct.unpack("<2i", data[:8])
+    return sanitize_pressure(first), sanitize_pressure(second)
+
+
+def sanitize_pressure(value: int) -> int:
+    """0 if the reading is outside the plausible range, else the reading."""
+    return 0 if value < 0 or value > PRESSURE_VALID_MAX else int(value)
+
+
+def decode_temperature(data: bytes) -> np.ndarray:
+    """
+    Temperature frame (0x038+f) -> 4 motor temperatures in degrees Celsius.
+
+    Undocumented for V5; WONIK's driver reads one unsigned byte per joint.
+    """
+    if len(data) < 4:
+        raise ValueError(f"temperature frame needs 4 bytes, got {len(data)}")
+    return np.array(struct.unpack("<4B", data[:4]), dtype=np.float64)
+
+
+def decode_imu(data: bytes) -> np.ndarray:
+    """
+    IMU frame (0x030) -> raw (roll, pitch, yaw).
+
+    Undocumented for V5, and WONIK's driver only prints the bytes, so the unit
+    is unverified. Reported raw.
+    """
+    if len(data) < 6:
+        raise ValueError(f"IMU frame needs 6 bytes, got {len(data)}")
+    return np.array(struct.unpack("<3h", data[:6]), dtype=np.float64)
 
 
 def decode_info(data: bytes) -> Tuple[int, int]:
     """Information frame (manual 11.3.4) -> (hardware_version, firmware_version)."""
     if len(data) < 4:
         raise ValueError(f"info frame needs at least 4 bytes, got {len(data)}")
-    hardware, firmware = struct.unpack("<HH", data[:4])
-    return hardware, firmware
+    return struct.unpack("<2H", data[:4])
 
 
 def decode_serial(data: bytes) -> str:
-    """Serial Number frame (manual 11.3.5) -> 8 ASCII characters."""
+    """Serial Number frame (manual 11.3.5) -> up to 8 ASCII characters."""
     return data[:8].decode("ascii", errors="replace").strip("\x00 ")
 
 
 def decode_error(data: bytes) -> JointError:
-    """Error frame (manual 11.3.10) -> (motor id, error flags)."""
+    """Error frame (manual 11.3.10) -> motor id and error flags."""
     if len(data) < 2:
         raise ValueError(f"error frame needs 2 bytes, got {len(data)}")
     return JointError(motor_id=data[0], code=ErrorFlag(data[1]))
-
-
-def finger_slice(finger: int) -> slice:
-    """Slice of the 16-joint arrays belonging to one finger."""
-    return slice(finger * NUM_JOINTS_PER_FINGER, (finger + 1) * NUM_JOINTS_PER_FINGER)
-
-
-def pressure_finger_base(msg_id: int) -> Optional[int]:
-    """First finger index reported by a pressure message, or None."""
-    return PRESSURE_ID_TO_FINGER.get(msg_id)
-
-
-def scale_plus_currents(currents_ma: np.ndarray, is_plus: bool) -> np.ndarray:
-    """Halve the MCP-2 currents on a type B (Plus) hand. Returns a new array."""
-    if not is_plus:
-        return currents_ma
-    out = np.asarray(currents_ma, dtype=np.float64).copy()
-    out[list(PLUS_HALVED_JOINTS)] *= 0.5
-    return out
-
-
-def sanitize_pressure(value: int) -> int:
-    """Clamp a fingertip reading to the plausible range; 0 if out of it."""
-    return 0 if value < 0 or value > PRESSURE_VALID_MAX else int(value)

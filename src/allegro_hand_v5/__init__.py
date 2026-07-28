@@ -1,25 +1,23 @@
 """
-Python driver for the Allegro Hand V5 (F4) / (F4) Plus.
+Pure-Python CAN driver for the Allegro Hand V5 (F4) / (F4) Plus.
 
-Torque-only CAN hardware, with a host-side PD loop running in its own process.
-No ROS, no libBHand.
+The hand is current-controlled hardware. This package talks to it over CAN,
+closes a PD loop on the host in its own process, and stays out of the way:
 
     from allegro_hand_v5 import AllegroHand, COMPLIANT
 
     with AllegroHand("can0", gains=COMPLIANT) as hand:
         print(hand.info)
-        hand.set_position_deg([0, 40, 40, 40] * 3 + [40, 140, 40, 40])
-        print(hand.positions_deg, hand.pressures, hand.errors)
+        hand.set_position(hand.calibration.center)
+        print(hand.positions, hand.pressures, hand.errors)
 """
 
-from allegro_hand_v5.bus import AllegroCANBus, BusState
+from allegro_hand_v5.bus import AllegroCANBus, BusState, describe_link, link_status
 from allegro_hand_v5.calibration import (
-    BUNDLED_DIR,
-    DEFAULT_RANGES,
-    HandCalibration,
-    available_calibrations,
-    calibration_search_paths,
-    default_calibration_path,
+    CALIBRATION_DIR,
+    NOMINAL_MAX,
+    NOMINAL_MIN,
+    Calibration,
     load_calibration,
 )
 from allegro_hand_v5.driver import AllegroHand, DriverConfig, HandState
@@ -31,71 +29,67 @@ from allegro_hand_v5.exceptions import (
     AllegroTimeoutError,
 )
 from allegro_hand_v5.gains import (
-    BHAND_HOME,
-    BHAND_JOINT_PD,
     COMPLIANT,
     DEFAULT,
-    PROFILES,
+    PRESETS,
     SAFE,
     SOFT,
     ZERO,
-    GainProfile,
-    get_profile,
+    Gains,
+    preset,
 )
 from allegro_hand_v5.protocol import (
     FINGER_NAMES,
-    JOINT_LABELS,
+    JOINT_INDEX,
     JOINT_NAMES,
+    MAX_CURRENT_MA,
     NUM_FINGERS,
     NUM_JOINTS,
     POSITION_SCALE,
-    TORQUE_TO_CURRENT,
     ErrorFlag,
     HandInfo,
     JointError,
     MsgID,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     # driver
     "AllegroHand",
     "DriverConfig",
     "HandState",
-    # transport / protocol
+    # transport and protocol
     "AllegroCANBus",
     "BusState",
+    "describe_link",
+    "link_status",
     "MsgID",
     "HandInfo",
     "JointError",
     "ErrorFlag",
     "POSITION_SCALE",
-    "TORQUE_TO_CURRENT",
+    "MAX_CURRENT_MA",
     "NUM_JOINTS",
     "NUM_FINGERS",
     "JOINT_NAMES",
-    "JOINT_LABELS",
+    "JOINT_INDEX",
     "FINGER_NAMES",
     # gains
-    "GainProfile",
-    "BHAND_HOME",
-    "BHAND_JOINT_PD",
+    "Gains",
+    "DEFAULT",
     "COMPLIANT",
     "SOFT",
     "SAFE",
     "ZERO",
-    "DEFAULT",
-    "PROFILES",
-    "get_profile",
+    "PRESETS",
+    "preset",
     # calibration
-    "HandCalibration",
+    "Calibration",
     "load_calibration",
-    "default_calibration_path",
-    "calibration_search_paths",
-    "available_calibrations",
-    "BUNDLED_DIR",
-    "DEFAULT_RANGES",
+    "CALIBRATION_DIR",
+    "NOMINAL_MIN",
+    "NOMINAL_MAX",
     # errors
     "AllegroError",
     "AllegroConnectionError",

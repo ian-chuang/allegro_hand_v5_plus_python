@@ -1,8 +1,32 @@
 # Allegro Hand V5 (F4) / (F4) Plus — User's Manual
 
+> ## ⚠️ Unverified transcription
+>
+> **This file was written by an LLM (Claude) reading
+> [`AllegroHandV5(4F)UserManual_v1.3.pdf`](AllegroHandV5%284F%29UserManual_v1.3.pdf),
+> not by WONIK ROBOTICS, and nobody has checked it line by line against the
+> original.** Numbers may have been transcribed wrongly, tables may have been
+> reflowed incorrectly, and the "Driver-relevant summary" at the bottom is
+> interpretation, not text from the manual.
+>
+> Treat it as a searchable index into the PDF, not as a source of truth. Before
+> relying on any value here — a message ID, a scale factor, a range of motion —
+> **open the PDF and check it.** The PDF ships in this repo next to this file.
+>
+> **Spot-checked so far** (re-extracted from the PDF and compared word for word,
+> 2026-07-28): §3 technical specifications, §10 CAN protocol, §11.1–11.3 in full
+> (message ID table, every data structure, the angle equation, the error bit
+> table), and the §15.1 range-of-motion table. Those sections are the ones this
+> package depends on, and they match. **Everything else is unchecked**, and
+> figures and dimensioned drawings were never text to begin with — they are
+> described from images and are the least trustworthy part of this file.
+>
+> Where this package's behaviour disagrees with this document, the disagreement
+> is noted in code and was resolved against the real hand or against WONIK's own
+> driver, [allegro_hand_ros2_v5](https://github.com/Wonikrobotics-git/allegro_hand_ros2_v5).
+
 > Source: `AllegroHandV5(4F)UserManual_v1.3.pdf` (WONIK ROBOTICS, rev 1.3, 2025-07-10).
-> This is a Markdown transcription for engineering reference. Figures/diagrams are
-> described in text; refer to the PDF for the original images.
+> Figures and diagrams are described in text; refer to the PDF for the originals.
 
 Copyright © WONIK ROBOTICS. All rights reserved. Allegro and Allegro Hand are
 trademarks of WONIK ROBOTICS.
@@ -344,8 +368,10 @@ https://github.com/Wonikrobotics-git/allegro_hand_v5_firmware
 | Thumb | MP | −5 ~ 106 |
 | Thumb | IP | −4 ~ 104 |
 
-> Per-finger joint order (Joint1→Joint4 in CAN messages) corresponds to MCP-1, MCP-2,
-> PIP, DIP for fingers and CMC-1, CMC-2, MP, IP for the thumb.
+> **Inference, not manual text:** the manual never says which CAN field is which joint.
+> Mapping Joint1→Joint4 in the Set Torque / Position messages onto MCP-1, MCP-2, PIP, DIP
+> (thumb: CMC-1, CMC-2, MP, IP) comes from WONIK's driver and URDF, where joint index
+> 4·finger+0 is the spread/abduction joint. This package uses that ordering throughout.
 
 ### 15.2 Software FAQ
 1. **Use V3/V4 software?** No — many differences between V5 and previous versions.
@@ -375,23 +401,45 @@ https://github.com/Wonikrobotics-git/allegro_hand_v5_firmware
 
 ---
 
-## Driver-relevant summary (engineering notes)
+## Driver-relevant summary (engineering notes — interpretation, not manual text)
+
+Everything below this line is a reading of the manual plus WONIK's
+[ROS 2 driver](https://github.com/Wonikrobotics-git/allegro_hand_ros2_v5), which
+is the more reliable of the two where they differ: it is what actually runs.
 
 **Bus:** CAN 2.0, **1 Mbps**, 11-bit standard IDs. Arbitration ID = `msg_id << 2`.
 
-**Everything is torque control.** The only actuation command is `Set Torque Finger N`
+**Everything is current control.** The only actuation command is `Set Torque Finger N`
 (IDs 0x060–0x063), 8 data bytes = four int16 little-endian values in **mA**, one per
-joint (MCP-1, MCP-2, PIP, DIP / thumb CMC-1, CMC-2, MP, IP). Position control (incl.
-"home") must be closed on the host from encoder feedback.
+joint (MCP-1, MCP-2, PIP, DIP / thumb CMC-1, CMC-2, MP, IP). Despite the name, the
+payload is a motor current, not a torque. Position control (including "home") must be
+closed on the host from encoder feedback. WONIK's driver saturates every value at
+**±240 mA** before transmitting.
 
 **Feedback (read via RTR remote frame or periodic report):**
 - Position Finger N (0x020–0x023): 4× int16 LE. `angle_rad = pos * (π/180) * 0.088`.
-- Fingertip Pressure 1/2 (0x50 / 0x52): 2× int32 LE, Pa. (0x50 = index, middle; 0x52 = ring, thumb.)
-- Information (0x080), Serial Number (0x088): RTR-readable; serial decides handedness/type.
+- Fingertip Pressure 1/2: 2× int32 LE, Pa. (First message = index, middle; second =
+  ring, thumb.) The manual and WONIK's driver both say **0x50 / 0x52**; the firmware
+  on the reference hand here streams them at **0xF0 / 0xF2**. This package accepts both.
+- Information (0x080), Serial Number (0x088): RTR-readable; the serial decides
+  handedness and hardware type. Real firmware often ignores the Information RTR.
 - Error (0xEE): [motor_id, error_code] bitmask (overload/eshock/overheat/input-voltage).
 
-**Lifecycle:** power on → Servo ON (0x040) to engage motors → stream Set Torque at up to
-500 Hz (hand's internal loop is 2 ms) → Servo OFF (0x041) / Torque-off to release.
+**Message IDs in WONIK's `candef.h` but not in the manual's table** — undocumented, and
+the firmware may or may not act on them:
+- `0x081` Set Period — three int16 (position, IMU, temperature) in ms. **Required**: it
+  is what makes the hand stream positions instead of answering one RTR per cycle.
+- `0x030` IMU, `0x038`–`0x03B` Temperature — RTR-readable and streamable via Set Period.
+- `0x0E0`–`0x0E3` Set Pose — inherited from the V4 protocol. The manual is explicit that
+  the board does torque control only, so this is presumed inert on V5.
+- `0x089` / `0x092` — start the hand's own position calibration, and its reply when done.
+- `0x068` Config — sets the CAN device ID and RS-485 baud rate. **Not implemented here**:
+  it writes persistent device configuration, is undocumented for V5, and getting it wrong
+  takes the hand off the bus.
 
-**Handedness:** V5 auto-detects from serial number; a driver should read the serial and
-select the correct joint sign convention (right vs left, §6) and joint limits (§15.1 ROM).
+**Lifecycle:** power on → Servo ON (0x040) to engage motors → stream Set Torque, one
+update per complete set of four position reports → Servo OFF (0x041) to release. The
+hand's internal loop is 2 ms; the default 3 ms position period gives ~333 Hz.
+
+**Handedness:** V5 auto-detects from the serial number; character 2 is the hardware type
+(A non-geared / B geared "Plus") and character 3 is handedness (R / L).
